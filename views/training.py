@@ -257,17 +257,17 @@ function tryRevengeMove() {
    매 리벤지 수 이후 평가만 별도로 새로 받아온 다음 판정한다. */
 function _refreshRevengeEval() {
   if (game.game_over()) { checkTest(); return; }
-  if (SF_PORT) {
-    fetchWithTimeout(sfUrl(game.fen()), 4000)
-      .then(function(r) { return r.json(); })
-      .then(function(data) { if (data.eval) updateEvalFromSF(data.eval); checkTest(); })
-      .catch(function() { checkTest(); });
-  } else {
-    var cp = staticEval(game);
-    lastEvalCp = userColor === 'b' ? -cp : cp;
-    updateEval(lastEvalCp);
+  engineGo(game.fen(), DEPTH, SKILL_LEVEL, function(move, cp) {
+    if (cp !== null) {
+      lastEvalCp = (userColor === 'b') ? -cp : cp;
+      updateEval(lastEvalCp);
+    } else {
+      var raw = staticEval(game);
+      lastEvalCp = userColor === 'b' ? -raw : raw;
+      updateEval(lastEvalCp);
+    }
     checkTest();
-  }
+  });
 }
 
 /* ── JS 체스 엔진 (알파-베타 + 기물 위치 테이블) ──────────────────── */
@@ -427,29 +427,159 @@ function setBadge(text, ready) {
   el.className = ready ? 'ready' : '';
 }
 
-/* ── Stockfish HTTP / JS 폴백 ──────────────────────────────────────── */
-/* 127.0.0.1 브릿지가 응답이 없거나(클라우드 배포 등) 막혀있을 때 무한 대기하지
-   않도록 모든 엔진 호출에 타임아웃을 건다. */
+/* ── 127.0.0.1 HTTP 브릿지 (로컬 개발용) ──────────────────────────── */
+/* 응답이 없거나(클라우드 배포 등) 막혀있을 때 무한 대기하지 않도록 타임아웃을 건다. */
 function fetchWithTimeout(url, timeoutMs) {
   var controller = new AbortController();
   var timer = setTimeout(function() { controller.abort(); }, timeoutMs || 4000);
   return fetch(url, { signal: controller.signal }).finally(function() { clearTimeout(timer); });
 }
 
-function sfUrl(fen) {
-  return 'http://127.0.0.1:' + SF_PORT
-    + '/move?fen=' + encodeURIComponent(fen)
-    + '&depth=' + DEPTH + '&skill=' + SKILL_LEVEL;
+/* ── 브라우저 내 Stockfish (WASM/asm.js, Web Worker) ─────────────────
+   127.0.0.1 브릿지는 로컬 개발 환경에서만 동작한다 (브라우저가 보는
+   127.0.0.1은 서버가 아니라 사용자 자신의 컴퓨터). 배포된 웹에서도 진짜
+   엔진이 동작하도록, CDN에서 받아온 스크립트를 Blob Worker로 돌린다. */
+var browserSf         = null;
+var browserSfReady     = false;
+var browserSfPending   = null;   /* 진행 중인 go 명령 1건의 콜백 */
+var browserSfMultiBuf  = null;   /* MultiPV 응답 수집용 (힌트용) */
+var browserSfLastCp    = 0;      /* 마지막으로 받은 score (둘 차례 쪽 기준, 원시값) */
+
+function initBrowserStockfish() {
+  fetch('https://unpkg.com/stockfish.js@10.0.2/stockfish.js')
+    .then(function(r) { if (!r.ok) throw new Error('fetch ' + r.status); return r.text(); })
+    .then(function(code) {
+      var blob = new Blob([code], { type: 'application/javascript' });
+      browserSf = new Worker(URL.createObjectURL(blob));
+      browserSf.onmessage = function(e) { onBrowserSfMessage(e.data); };
+      browserSf.onerror   = function() { browserSf = null; };
+      browserSf.postMessage('uci');
+      browserSf.postMessage('isready');
+    })
+    .catch(function() { /* 실패해도 HTTP 브릿지/JS 폴백으로 자연히 넘어감 */ });
 }
 
-function updateEvalFromSF(ev) {
-  if (!ev) return;
-  var cp = ev.type === 'mate'
-    ? (ev.value > 0 ? 9999 : -9999)
-    : ev.value;            /* 스톡피쉬는 백 기준 cp 반환 */
-  if (userColor === 'b') cp = -cp;
-  lastEvalCp = cp;
-  updateEval(cp);
+function onBrowserSfMessage(line) {
+  if (typeof line !== 'string') return;
+
+  if (line === 'readyok' && !browserSfReady) {
+    browserSfReady = true;
+    setBadge('🟢 Stockfish (브라우저)', true);
+    return;
+  }
+
+  if (browserSfMultiBuf && line.indexOf('info ') === 0 && line.indexOf('multipv') >= 0) {
+    var mvm = line.match(/multipv (\d+)/);
+    var mpv = line.match(/ pv (\S+)/);
+    if (mvm && mpv) {
+      var mcp = line.match(/score cp (-?\d+)/);
+      var mmate = line.match(/score mate (-?\d+)/);
+      var cp = mmate ? (parseInt(mmate[1]) > 0 ? 9999 : -9999) : (mcp ? parseInt(mcp[1]) : 0);
+      browserSfMultiBuf[parseInt(mvm[1]) - 1] = { Move: mpv[1], Centipawn: cp };
+    }
+  } else if (!browserSfMultiBuf) {
+    var m2 = line.match(/score cp (-?\d+)/);
+    var m3 = line.match(/score mate (-?\d+)/);
+    if (m3) browserSfLastCp = parseInt(m3[1]) > 0 ? 9999 : -9999;
+    else if (m2) browserSfLastCp = parseInt(m2[1]);
+  }
+
+  if (line.indexOf('bestmove') === 0) {
+    var parts = line.split(' ');
+    var bm = (parts[1] && parts[1] !== '(none)') ? parts[1] : null;
+    var cb = browserSfPending; browserSfPending = null;
+    if (!cb) return;
+    if (browserSfMultiBuf) {
+      var list = [];
+      for (var i = 0; i < browserSfMultiBuf.length; i++) if (browserSfMultiBuf[i]) list.push(browserSfMultiBuf[i]);
+      browserSfMultiBuf = null;
+      cb(list);
+    } else {
+      cb(bm, browserSfLastCp);
+    }
+  }
+}
+
+/* 단일 최선의 수 + 평가. 콜백의 cp는 항상 "백 기준" 절대값으로 변환해서 전달한다. */
+function browserSfGo(fen, depth, skill, callback) {
+  if (!browserSfReady) { callback(null, null); return; }
+  var sideToMove = fen.split(' ')[1];
+  browserSfMultiBuf = null;
+  browserSfPending = function(move, rawCp) {
+    var cp = (rawCp === null || rawCp === undefined) ? null : (sideToMove === 'b' ? -rawCp : rawCp);
+    callback(move, cp);
+  };
+  browserSf.postMessage('setoption name MultiPV value 1');
+  browserSf.postMessage('setoption name Skill Level value ' + skill);
+  browserSf.postMessage('position fen ' + fen);
+  browserSf.postMessage('go depth ' + depth);
+}
+
+/* 힌트용 후보 n개 (정석/공격적 대안 분류는 호출부에서 처리) */
+function browserSfGoMulti(fen, depth, skill, n, callback) {
+  if (!browserSfReady) { callback([]); return; }
+  browserSfMultiBuf = new Array(n);
+  browserSfPending = function(list) { callback(list || []); };
+  browserSf.postMessage('setoption name MultiPV value ' + n);
+  browserSf.postMessage('setoption name Skill Level value ' + skill);
+  browserSf.postMessage('position fen ' + fen);
+  browserSf.postMessage('go depth ' + depth);
+}
+
+/* ── 통합 엔진 호출: 로컬 HTTP 브릿지(있으면) → 브라우저 Stockfish → 실패 시 null ──
+   onResult(move, cp, source) — source는 'http' | 'browser' | null(둘 다 실패, JS 폴백 필요) */
+function engineGo(fen, depth, skill, onResult) {
+  if (SF_PORT) {
+    _engineGoHttp(fen, depth, skill, function(move, cp) {
+      if (move) { onResult(move, cp, 'http'); return; }
+      _engineGoBrowser(fen, depth, skill, onResult);
+    });
+  } else {
+    _engineGoBrowser(fen, depth, skill, onResult);
+  }
+}
+
+function _engineGoBrowser(fen, depth, skill, onResult) {
+  if (!browserSfReady) { onResult(null, null, null); return; }
+  browserSfGo(fen, depth, skill, function(move, cp) { onResult(move, cp, move ? 'browser' : null); });
+}
+
+function _engineGoHttp(fen, depth, skill, onResult) {
+  var url = 'http://127.0.0.1:' + SF_PORT
+    + '/move?fen=' + encodeURIComponent(fen) + '&depth=' + depth + '&skill=' + skill;
+  fetchWithTimeout(url, 4000)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var cp = null;
+      if (data.eval) cp = data.eval.type === 'mate' ? (data.eval.value > 0 ? 9999 : -9999) : data.eval.value;
+      onResult(data.move || null, cp);
+    })
+    .catch(function() { onResult(null, null); });
+}
+
+function engineTopMoves(fen, depth, skill, n, onResult) {
+  if (SF_PORT) {
+    _engineTopMovesHttp(fen, depth, skill, n, function(list) {
+      if (list && list.length) { onResult(list, 'http'); return; }
+      _engineTopMovesBrowser(fen, depth, skill, n, onResult);
+    });
+  } else {
+    _engineTopMovesBrowser(fen, depth, skill, n, onResult);
+  }
+}
+
+function _engineTopMovesBrowser(fen, depth, skill, n, onResult) {
+  if (!browserSfReady) { onResult([], null); return; }
+  browserSfGoMulti(fen, depth, skill, n, function(list) { onResult(list, (list && list.length) ? 'browser' : null); });
+}
+
+function _engineTopMovesHttp(fen, depth, skill, n, onResult) {
+  var url = 'http://127.0.0.1:' + SF_PORT
+    + '/topmoves?fen=' + encodeURIComponent(fen) + '&depth=' + depth + '&skill=' + skill + '&n=' + n;
+  fetchWithTimeout(url, 6000)
+    .then(function(r) { return r.json(); })
+    .then(function(data) { onResult(data.moves || []); })
+    .catch(function() { onResult([]); });
 }
 
 /* JS 미니맥스 폴백 */
@@ -473,23 +603,21 @@ function requestBotMove() {
   var id = ++reqId;
   setBadge('🤔 생각 중...', true);
 
-  if (!SF_PORT) { _jsBotMove(); return; }
-
-  fetchWithTimeout(sfUrl(game.fen()), 4000)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (reqId !== id) return;          /* 리셋으로 무효화된 응답 무시 */
-      pendingBot = false;
-      setBadge('🟢 Stockfish 16', true);
-      if (data.move) {
-        updateEvalFromSF(data.eval);
-        applyUciMove(data.move);
+  engineGo(game.fen(), DEPTH, SKILL_LEVEL, function(uciMove, cp, source) {
+    if (reqId !== id) return;
+    pendingBot = false;
+    if (uciMove) {
+      setBadge(source === 'browser' ? '🟢 Stockfish (브라우저)' : '🟢 Stockfish 16', true);
+      if (cp !== null) {
+        var c = (userColor === 'b') ? -cp : cp;
+        lastEvalCp = c;
+        updateEval(c);
       }
-    })
-    .catch(function() {
-      if (reqId !== id) return;
+      applyUciMove(uciMove);
+    } else {
       _jsBotMove();
-    });
+    }
+  });
 }
 
 function requestHint() {
@@ -499,33 +627,18 @@ function requestHint() {
   var id = ++reqId;
   setBadge('🤔 힌트...', true);
 
-  if (!SF_PORT) {
-    setTimeout(function() {
-      var res = getBestMove(Math.max(DEPTH, 4));
-      setBadge('🟢 JS 엔진', true);
-      if (res && res.move) showHintArrows([{ Move: res.move.from + res.move.to }]);
-    }, 30);
-    return;
-  }
-
   /* 힌트는 depth를 최소 12 이상으로, 후보 4개를 받아 정석/공격적 대안으로 분류 */
-  var hintUrl = 'http://127.0.0.1:' + SF_PORT
-    + '/topmoves?fen=' + encodeURIComponent(game.fen())
-    + '&depth=' + Math.max(DEPTH, 12) + '&skill=' + SKILL_LEVEL + '&n=4';
-
-  fetchWithTimeout(hintUrl, 6000)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (reqId !== id) return;
-      setBadge('🟢 Stockfish 16', true);
-      showHintArrows(data.moves || []);
-    })
-    .catch(function() {
-      if (reqId !== id) return;
+  engineTopMoves(game.fen(), Math.max(DEPTH, 12), SKILL_LEVEL, 4, function(moves, source) {
+    if (reqId !== id) return;
+    if (moves && moves.length) {
+      setBadge(source === 'browser' ? '🟢 Stockfish (브라우저)' : '🟢 Stockfish 16', true);
+      showHintArrows(moves);
+    } else {
       var res = getBestMove(Math.max(DEPTH, 4));
       setBadge('⚠ JS 폴백', false);
       if (res && res.move) showHintArrows([{ Move: res.move.from + res.move.to }]);
-    });
+    }
+  });
 }
 
 /* 후보 수 목록(엔진 순위) 중 1번 = 정석 추천, 캡처/체크가 되는 첫 수 = 공격적 대안 */
@@ -915,11 +1028,12 @@ function applyRevengeColorLock() {
 
 /* 첫 수를 두기 전에도 엔진 평가가 0.0으로 비어있지 않도록, 시작 포지션을 한 번 평가해둔다. */
 function requestInitialEval() {
-  if (!SF_PORT || game.game_over()) return;
-  fetchWithTimeout(sfUrl(game.fen()), 4000)
-    .then(function(r) { return r.json(); })
-    .then(function(data) { if (data.eval) updateEvalFromSF(data.eval); })
-    .catch(function() {});
+  if (game.game_over()) return;
+  engineGo(game.fen(), DEPTH, SKILL_LEVEL, function(move, cp) {
+    if (cp === null) return;
+    lastEvalCp = (userColor === 'b') ? -cp : cp;
+    updateEval(lastEvalCp);
+  });
 }
 
 function undoMove() {
@@ -968,7 +1082,18 @@ board = Chessboard('board', {
 });
 updateStatus();
 $(window).resize(board.resize);
-setBadge(SF_PORT ? '🟢 Stockfish 16' : '🟢 JS 엔진', true);
+
+if (SF_PORT) {
+  setBadge('🟢 Stockfish 16', true);
+} else {
+  setBadge('⏳ 브라우저 엔진 로딩...', true);
+  initBrowserStockfish();
+  /* 8초 안에 못 뜨면 JS 폴백으로 안내만 바꿔준다 (실제 동작은 engineGo가 그때그때 판단) */
+  setTimeout(function() {
+    if (!browserSfReady) setBadge('🟢 JS 엔진', true);
+  }, 8000);
+}
+
 updateRevengeLabel();
 if (applyRevengeColorLock()) requestInitialEval();
 </script>
