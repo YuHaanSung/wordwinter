@@ -196,7 +196,6 @@ var OPPONENT_NAME      = __OPPONENT_NAME__;
 var REVENGE_REPLAY_ON  = __REVENGE_REPLAY_ON__;   /* 체크박스로 "재현" 자체를 켰을 때만 true */
 
 var game, board;
-var boardReady      = false;   /* 블런더 지점 스캔 끝나고 보드가 실제로 만들어졌는지 */
 var openingPlyCount = 0;
 var testResult      = null;
 var userColor       = null;
@@ -212,7 +211,6 @@ var revengeTokens   = [];
 var userHistColor   = null;   /* 'w' | 'b' — 실제 패배한 게임에서 유저가 둔 색 */
 var revengeOn       = false;  /* 상대 수를 실제로 "재현"할지 — 데이터 존재 + 체크박스 둘 다 필요 */
 var revengeDerailed = false;
-var smartCutoffPly  = null;   /* 블런더 지점 스캔 결과 (ply). 못 찾으면 null → 기존 8수 컷오프로 폴백 */
 
 function parseRevengeTokens(pgnText) {
   var out = [];
@@ -955,6 +953,7 @@ def _build_html(
     supabase_key: str,
     revenge_pgn: str,
     opponent_name: str,
+    revenge_replay_on: bool,
 ) -> str:
     safe_moves    = json.dumps(opening_moves).replace("<", "\\u003c").replace(">", "\\u003e")
     safe_uris     = json.dumps(_load_piece_uris())
@@ -973,6 +972,7 @@ def _build_html(
         .replace("__SUPABASE_KEY__", json.dumps(supabase_key))
         .replace("__REVENGE_PGN__", safe_revenge)
         .replace("__OPPONENT_NAME__", safe_opponent)
+        .replace("__REVENGE_REPLAY_ON__", "true" if revenge_replay_on else "false")
     )
 
 
@@ -1081,7 +1081,7 @@ def render_training() -> None:
     components.html(
         _build_html(
             opening_moves, skill_level, depth, sf_port, user_id, eco, sb_url, sb_key,
-            full_lost_pgn if revenge_on else "", opponent_name,
+            full_lost_pgn, opponent_name, revenge_on,
         ),
         height=540, scrolling=False,
     )
