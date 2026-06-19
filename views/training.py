@@ -258,7 +258,7 @@ function tryRevengeMove() {
 function _refreshRevengeEval() {
   if (game.game_over()) { checkTest(); return; }
   if (SF_PORT) {
-    fetch(sfUrl(game.fen()))
+    fetchWithTimeout(sfUrl(game.fen()), 4000)
       .then(function(r) { return r.json(); })
       .then(function(data) { if (data.eval) updateEvalFromSF(data.eval); checkTest(); })
       .catch(function() { checkTest(); });
@@ -349,8 +349,12 @@ function staticEval(g) {
   return score;
 }
 
-function alphaBeta(g, depth, alpha, beta, isMax) {
-  if (depth === 0 || g.game_over()) return staticEval(g);
+/* 시간 예산(ms) — 포지션이 복잡해도 이 시간을 넘기면 즉시 탐색을 끊는다.
+   (Stockfish 브릿지가 없는 배포 환경에서 JS 폴백이 브라우저를 멈춰버리는 것 방지) */
+var JS_ENGINE_TIME_BUDGET_MS = 1200;
+
+function alphaBeta(g, depth, alpha, beta, isMax, deadline) {
+  if (depth === 0 || g.game_over() || Date.now() > deadline) return staticEval(g);
   var moves = g.moves({ verbose: true });
   /* 캡처 우선 정렬 → 가지치기 효율 향상 */
   moves.sort(function(a, b) {
@@ -360,39 +364,61 @@ function alphaBeta(g, depth, alpha, beta, isMax) {
   if (isMax) {
     var best = -Infinity;
     for (var i = 0; i < moves.length; i++) {
-      g.move(moves[i]); best = Math.max(best, alphaBeta(g, depth-1, alpha, beta, false)); g.undo();
+      g.move(moves[i]); best = Math.max(best, alphaBeta(g, depth-1, alpha, beta, false, deadline)); g.undo();
       alpha = Math.max(alpha, best);
-      if (alpha >= beta) break;
+      if (alpha >= beta || Date.now() > deadline) break;
     }
     return best;
   } else {
     var best = Infinity;
     for (var i = 0; i < moves.length; i++) {
-      g.move(moves[i]); best = Math.min(best, alphaBeta(g, depth-1, alpha, beta, true)); g.undo();
+      g.move(moves[i]); best = Math.min(best, alphaBeta(g, depth-1, alpha, beta, true, deadline)); g.undo();
       beta = Math.min(beta, best);
-      if (alpha >= beta) break;
+      if (alpha >= beta || Date.now() > deadline) break;
     }
     return best;
   }
 }
 
-function getBestMove(depth) {
+function _searchAtDepth(depth, deadline) {
   var moves = game.moves({ verbose: true }); if (!moves.length) return null;
   var isMax = game.turn() === 'w';
   var bestMove = null, bestScore = isMax ? -Infinity : Infinity;
-  /* 같은 점수일 때 다양성을 위해 섞기 */
-  moves.sort(function() { return Math.random() - 0.5; });
   moves.sort(function(a, b) {
     return (b.captured ? MV[b.captured] || 0 : 0) -
            (a.captured ? MV[a.captured] || 0 : 0);
   });
   for (var i = 0; i < moves.length; i++) {
+    if (Date.now() > deadline) break;
     game.move(moves[i]);
-    var sc = alphaBeta(game, depth - 1, -Infinity, Infinity, !isMax);
+    var sc = alphaBeta(game, depth - 1, -Infinity, Infinity, !isMax, deadline);
     game.undo();
     if (isMax ? sc > bestScore : sc < bestScore) { bestScore = sc; bestMove = moves[i]; }
   }
-  return { move: bestMove, score: bestScore };
+  return bestMove ? { move: bestMove, score: bestScore } : null;
+}
+
+/* depth까지 점진적으로 깊어지는 iterative deepening. 매 깊이/매 노드마다 시간을
+   확인하므로 maxDepth가 얼마든 JS_ENGINE_TIME_BUDGET_MS를 거의 넘기지 않는다. */
+function getBestMove(maxDepth) {
+  var deadline = Date.now() + JS_ENGINE_TIME_BUDGET_MS;
+  var best = null;
+  for (var d = 1; d <= maxDepth; d++) {
+    if (Date.now() > deadline) break;
+    var res = _searchAtDepth(d, deadline);
+    if (res) best = res;
+  }
+  if (!best) {
+    /* 시간이 너무 없어서 depth 1조차 못 끝냈을 때의 안전망: 합법수 중 캡처 우선 1개 */
+    var moves = game.moves({ verbose: true });
+    if (moves.length) {
+      moves.sort(function(a, b) {
+        return (b.captured ? MV[b.captured] || 0 : 0) - (a.captured ? MV[a.captured] || 0 : 0);
+      });
+      best = { move: moves[0], score: 0 };
+    }
+  }
+  return best;
 }
 
 function setBadge(text, ready) {
@@ -402,6 +428,14 @@ function setBadge(text, ready) {
 }
 
 /* ── Stockfish HTTP / JS 폴백 ──────────────────────────────────────── */
+/* 127.0.0.1 브릿지가 응답이 없거나(클라우드 배포 등) 막혀있을 때 무한 대기하지
+   않도록 모든 엔진 호출에 타임아웃을 건다. */
+function fetchWithTimeout(url, timeoutMs) {
+  var controller = new AbortController();
+  var timer = setTimeout(function() { controller.abort(); }, timeoutMs || 4000);
+  return fetch(url, { signal: controller.signal }).finally(function() { clearTimeout(timer); });
+}
+
 function sfUrl(fen) {
   return 'http://127.0.0.1:' + SF_PORT
     + '/move?fen=' + encodeURIComponent(fen)
@@ -441,7 +475,7 @@ function requestBotMove() {
 
   if (!SF_PORT) { _jsBotMove(); return; }
 
-  fetch(sfUrl(game.fen()))
+  fetchWithTimeout(sfUrl(game.fen()), 4000)
     .then(function(r) { return r.json(); })
     .then(function(data) {
       if (reqId !== id) return;          /* 리셋으로 무효화된 응답 무시 */
@@ -479,7 +513,7 @@ function requestHint() {
     + '/topmoves?fen=' + encodeURIComponent(game.fen())
     + '&depth=' + Math.max(DEPTH, 12) + '&skill=' + SKILL_LEVEL + '&n=4';
 
-  fetch(hintUrl)
+  fetchWithTimeout(hintUrl, 6000)
     .then(function(r) { return r.json(); })
     .then(function(data) {
       if (reqId !== id) return;
@@ -718,7 +752,7 @@ function _autoRecord() {
       var url = 'http://127.0.0.1:' + SF_PORT
         + '/record?user_id=' + encodeURIComponent(USER_ID)
         + '&eco_code=' + encodeURIComponent(ECO_CODE);
-      fetch(url)
+      fetchWithTimeout(url, 4000)
         .then(function(r) { return r.json(); })
         .then(function(data) {
           var banner = document.getElementById('result-banner');
@@ -882,7 +916,7 @@ function applyRevengeColorLock() {
 /* 첫 수를 두기 전에도 엔진 평가가 0.0으로 비어있지 않도록, 시작 포지션을 한 번 평가해둔다. */
 function requestInitialEval() {
   if (!SF_PORT || game.game_over()) return;
-  fetch(sfUrl(game.fen()))
+  fetchWithTimeout(sfUrl(game.fen()), 4000)
     .then(function(r) { return r.json(); })
     .then(function(data) { if (data.eval) updateEvalFromSF(data.eval); })
     .catch(function() {});
