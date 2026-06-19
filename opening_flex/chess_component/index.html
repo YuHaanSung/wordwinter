@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet"
+  href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: transparent;
+  padding: 8px 4px;
+}
+.layout { display: flex; gap: 14px; align-items: flex-start; }
+#board  { width: 360px; flex-shrink: 0; }
+.side { flex: 1; display: flex; flex-direction: column; gap: 10px; min-width: 160px; }
+
+.status-card {
+  background: #1e293b; color: #f8fafc;
+  border-radius: 10px; padding: 10px 14px;
+}
+.lbl { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing:.05em; }
+.status-val { font-size: 15px; font-weight: 700; margin-top: 3px; }
+.status-val.check { color: #f87171; }
+.status-val.over  { color: #4ade80; }
+
+.moves-card {
+  background: #fff; border: 1px solid #e2e8f0;
+  border-radius: 10px; padding: 10px 12px;
+}
+.moves-body {
+  font-size: 12px; color: #475569; line-height: 1.9;
+  height: 110px; overflow-y: auto; margin-top: 5px;
+}
+
+#result-banner {
+  display: none;
+  padding: 10px 14px; border-radius: 10px;
+  font-size: 13px; font-weight: 700; text-align: center;
+}
+#result-banner.pass { background: #dcfce7; color: #166534; }
+#result-banner.fail { background: #fee2e2; color: #991b1b; }
+
+.score-row {
+  font-size: 11px; color: #64748b; margin-top: 4px;
+}
+
+.btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+button {
+  padding: 7px 13px; border: none; border-radius: 8px;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+}
+button:hover { opacity: .82; }
+.btn-p { background: #3b82f6; color: #fff; }
+.btn-s { background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div id="board"></div>
+  <div class="side">
+    <div class="status-card">
+      <div class="lbl">게임 상태</div>
+      <div class="status-val" id="sv">로딩 중...</div>
+      <div class="score-row" id="score-row"></div>
+    </div>
+    <div class="moves-card">
+      <div class="lbl">기보</div>
+      <div class="moves-body" id="mv">
+        <span style="color:#cbd5e1">수를 두면 기록됩니다</span>
+      </div>
+    </div>
+    <div id="result-banner"></div>
+    <div class="btn-row">
+      <button class="btn-p" onclick="resetBoard()">↺ 처음으로</button>
+      <button class="btn-s" onclick="undoMove()">← 무르기</button>
+      <button class="btn-s" onclick="flipBoard()">⇅ 뒤집기</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script>
+// ── Streamlit component protocol ──────────────────────────────────────────────
+function toStreamlit(type, extra) {
+  window.parent.postMessage(Object.assign({ type: type }, extra || {}), '*');
+}
+toStreamlit('streamlit:componentReady', { apiVersion: 1 });
+toStreamlit('streamlit:setFrameHeight', { height: 490 });
+
+// ── State ─────────────────────────────────────────────────────────────────────
+var OPENING_MOVES  = '';
+var PIECE_URIS     = {};
+var ECO_CODE       = '';
+var game, board;
+var openingPlyCount = 0;   // plies already in game after buildGame()
+var testResult      = null; // null | 'pass' | 'fail'
+var initialized     = false;
+var userColor       = null; // 'w' or 'b', detected on first interactive move
+
+// ── Receive props from Streamlit ──────────────────────────────────────────────
+window.addEventListener('message', function (event) {
+  if (!event.data || event.data.type !== 'streamlit:render') return;
+  var args   = event.data.args || {};
+  var newEco = args.eco_code || '';
+
+  if (!initialized || newEco !== ECO_CODE) {
+    ECO_CODE       = newEco;
+    OPENING_MOVES  = args.opening_moves || '';
+    PIECE_URIS     = args.piece_uris    || {};
+    testResult     = null;
+    userColor      = null;
+    hideResult();
+
+    if (!board) {
+      initBoard();
+    } else {
+      game = buildGame();
+      board.position(game.fen(), false);
+      updateStatus();
+    }
+    initialized = true;
+  }
+});
+
+// ── Chess logic ───────────────────────────────────────────────────────────────
+function buildGame() {
+  var g = new Chess();
+  var count = 0;
+  if (OPENING_MOVES) {
+    var tokens = OPENING_MOVES.trim().split(/\s+/);
+    for (var i = 0; i < tokens.length; i++) {
+      if (/^\d+\./.test(tokens[i])) continue;
+      if (!g.move(tokens[i], { sloppy: true })) break;
+      count++;
+    }
+  }
+  openingPlyCount = count;
+  return g;
+}
+
+function initBoard() {
+  game = buildGame();
+  board = Chessboard('board', {
+    draggable:     true,
+    position:      game.fen(),
+    onDragStart:   onDragStart,
+    onDrop:        onDrop,
+    onSnapEnd:     onSnapEnd,
+    pieceTheme:    pieceTheme,
+    moveSpeed:     'fast',
+    snapbackSpeed: 200,
+    snapSpeed:     100,
+  });
+  updateStatus();
+  $(window).resize(board.resize);
+}
+
+function pieceTheme(piece) {
+  if (PIECE_URIS && PIECE_URIS[piece]) return PIECE_URIS[piece];
+  return 'https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/img/chesspieces/wikipedia/' + piece + '.png';
+}
+
+// ── Material evaluation ───────────────────────────────────────────────────────
+var PIECE_VALS = { q: 9, r: 5, b: 3, n: 3, p: 1 };
+
+function calcMaterial() {
+  var fen = game.fen().split(' ')[0];
+  var w = 0, b = 0;
+  for (var i = 0; i < fen.length; i++) {
+    var c = fen[i], v = PIECE_VALS[c.toLowerCase()];
+    if (!v) continue;
+    if (c === c.toUpperCase()) w += v; else b += v;
+  }
+  return { white: w, black: b };
+}
+
+function interactivePlies() {
+  return game.history().length - openingPlyCount;
+}
+
+function checkTest() {
+  if (testResult !== null) return;
+
+  var mat      = calcMaterial();
+  var uColor   = userColor || 'w';
+  var userScore = uColor === 'w' ? mat.white : mat.black;
+  var botScore  = uColor === 'w' ? mat.black : mat.white;
+  var passed;
+
+  if (game.in_checkmate()) {
+    // game.turn() is the side that has been mated
+    passed = (game.turn() !== uColor);
+  } else if (game.in_stalemate() || game.in_draw()) {
+    passed = (userScore >= botScore);
+  } else if (interactivePlies() >= 7) {
+    passed = (userScore >= botScore);
+  } else {
+    return; // Not yet decided
+  }
+
+  testResult = passed ? 'pass' : 'fail';
+  showResult(passed, userScore, botScore);
+
+  if (passed) {
+    toStreamlit('streamlit:setComponentValue', {
+      value: { result: 'pass', eco_code: ECO_CODE }
+    });
+  }
+}
+
+function showResult(passed, userScore, botScore) {
+  var banner = document.getElementById('result-banner');
+  banner.style.display = 'block';
+  banner.className = passed ? 'pass' : 'fail';
+  banner.textContent = passed
+    ? '방어 성공!  나 ' + userScore + '점  봇 ' + botScore + '점'
+    : '방어 실패  나 ' + userScore + '점  봇 ' + botScore + '점';
+}
+function hideResult() {
+  var b = document.getElementById('result-banner');
+  if (b) { b.style.display = 'none'; b.className = ''; }
+}
+
+// ── Bot ───────────────────────────────────────────────────────────────────────
+function makeBotMove() {
+  if (game.game_over()) return;
+  var moves = game.moves({ verbose: true });
+  if (!moves.length) return;
+
+  var best = null;
+  for (var i = 0; i < moves.length; i++) {
+    var g2 = new Chess(game.fen());
+    g2.move(moves[i]);
+    if (g2.in_checkmate()) { best = moves[i]; break; }
+  }
+  if (!best) {
+    var checks   = moves.filter(function (m) { return m.san.indexOf('+') >= 0; });
+    var captures = moves.filter(function (m) { return m.san.indexOf('x') >= 0; });
+    var center   = moves.filter(function (m) {
+      return ['e4', 'e5', 'd4', 'd5'].indexOf(m.to) >= 0;
+    });
+    var pool = checks.length ? checks : captures.length ? captures : center.length ? center : moves;
+    best = pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  game.move(best);
+  board.position(game.fen());
+  updateStatus();
+  checkTest();
+}
+
+// ── Board event handlers ──────────────────────────────────────────────────────
+function onDragStart(source, piece) {
+  if (game.game_over()) return false;
+  if (game.turn() === 'w' && piece.search(/^b/) !== -1) return false;
+  if (game.turn() === 'b' && piece.search(/^w/) !== -1) return false;
+}
+function onDrop(source, target) {
+  if (userColor === null) userColor = game.turn();
+  var move = game.move({ from: source, to: target, promotion: 'q' });
+  if (move === null) return 'snapback';
+  updateStatus();
+  if (game.game_over()) {
+    checkTest();
+  } else {
+    setTimeout(makeBotMove, 420);
+  }
+}
+function onSnapEnd() { board.position(game.fen()); }
+
+// ── Status display ────────────────────────────────────────────────────────────
+function updateStatus() {
+  var el  = document.getElementById('sv');
+  var trn = game.turn() === 'w' ? '백' : '흑';
+
+  if (game.in_checkmate()) {
+    el.className = 'status-val over';
+    el.textContent = (game.turn() === 'w' ? '흑' : '백') + ' 승리 🎉 체크메이트';
+  } else if (game.in_stalemate()) {
+    el.className = 'status-val over';
+    el.textContent = '스테일메이트 — 무승부';
+  } else if (game.in_draw()) {
+    el.className = 'status-val over';
+    el.textContent = '무승부';
+  } else if (game.in_check()) {
+    el.className = 'status-val check';
+    el.textContent = trn + ' 차례  ⚠ 체크!';
+  } else {
+    el.className = 'status-val';
+    el.textContent = trn + ' 차례';
+  }
+
+  var mat = calcMaterial();
+  var uColor = userColor || 'w';
+  var uScore = uColor === 'w' ? mat.white : mat.black;
+  var bScore = uColor === 'w' ? mat.black : mat.white;
+  var plies  = interactivePlies();
+  var scoreEl = document.getElementById('score-row');
+  if (scoreEl) {
+    scoreEl.textContent = '나 ' + uScore + 'pt  봇 ' + bScore + 'pt'
+      + (plies < 7 ? '  (' + (7 - plies) + '수 남음)' : '');
+  }
+
+  renderMoves();
+}
+
+function renderMoves() {
+  var hist = game.history();
+  var el   = document.getElementById('mv');
+  if (!hist.length) {
+    el.innerHTML = '<span style="color:#cbd5e1">수를 두면 기록됩니다</span>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < hist.length; i += 2) {
+    html += '<span style="color:#94a3b8">' + (Math.floor(i / 2) + 1) + '.</span> '
+          + hist[i] + (hist[i + 1] ? ' ' + hist[i + 1] : '') + '&nbsp; ';
+  }
+  el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+function resetBoard() {
+  testResult = null;
+  userColor  = null;
+  hideResult();
+  game = buildGame();
+  board.position(game.fen(), false);
+  updateStatus();
+}
+function undoMove() {
+  if (game.history().length <= openingPlyCount) return;
+  game.undo();
+  if (game.history().length > openingPlyCount) game.undo();
+  board.position(game.fen(), false);
+  updateStatus();
+}
+function flipBoard() { board.flip(); }
+</script>
+</body>
+</html>
